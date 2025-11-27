@@ -1,78 +1,62 @@
-import java.io.*;
-import java.net.*;
-import java.util.Locale;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.Socket;
 import java.util.Scanner;
 
 public class client {
+
+    private static final String HOST = "127.0.0.1"; // adapte si besoin
+    private static final int PORT = 11000;
+
     public static void main(String[] args) {
-        String serverAddress = "localhost";
-        int port = 11000; 
-
         try (
-            Socket socket = new Socket(serverAddress, port);
-            PrintWriter writer = new PrintWriter(socket.getOutputStream(), true);
-            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            Scanner scanner = new Scanner(System.in)
+                Socket socket = new Socket(HOST, PORT);
+                PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+                BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                Scanner scanner = new Scanner(System.in)
         ) {
-            System.out.println(" Connexion au serveur établie.");
-            System.out.println("------------------------------------");
+            System.out.println("Connexion au serveur " + HOST + ":" + PORT);
 
-            // === Étape 1 : ID joueur ===
-            System.out.print("Entrez l'ID du joueur : ");
-            String idJoueur = scanner.nextLine().trim();
-            writer.println("ID_JOUEUR:" + idJoueur);
+          
+            System.out.print("Entrez votre ID_JOUEUR: ");
+            String id = scanner.nextLine().trim();
+            out.println("ID_JOUEUR:" + id);
 
-            String response = reader.readLine();
-            System.out.println("SERVEUR : " + response);
-            if (response == null) return;
+            String line;
+            while ((line = in.readLine()) != null) {
+               
+                System.out.println("SERVEUR: " + line);
 
-            // Demande mot de passe 
-            String r1 = response.toLowerCase(Locale.ROOT);
-            if (r1.contains("mot de passe")) {
-                System.out.print("Entrez le mot de passe : ");
-                String motDePasse = scanner.nextLine().trim();
-                writer.println("MOT_DE_PASSE:" + motDePasse);
+      
+                if (line.startsWith("ACCES AUTORISE") || line.startsWith("ACCES REFUSE")) {
+                    break;
+                }
 
-                response = reader.readLine();
-                System.out.println("SERVEUR : " + response);
-                if (response == null) return;
-
-                // Demande QR 
-                String r2 = response.toLowerCase(Locale.ROOT);
-                if (r2.contains("qr")) { 
-                    System.out.print("Scannez / entrez le code QR : ");
+                if (line.startsWith("DATE_NAISSANCE:")) {
+                    System.out.print("Entrez votre date de naissance (YYYY-MM-DD): ");
+                    String date = scanner.nextLine().trim();
+                    out.println("DATE_NAISSANCE:" + date);
+                }
+              
+                else if (line.equals("NOM_EQUIPE:?")) {
+                    System.out.print("Entrez le nom de votre equipe: ");
+                    String nomEquipe = scanner.nextLine().trim();
+                    out.println("NOM_EQUIPE:" + nomEquipe);
+                }
+       
+                else if (line.equals("QR_CODE:?")) {
+                    System.out.print("Scannez / entrez le QR code: ");
                     String qr = scanner.nextLine().trim();
-                    writer.println("QR_CODE:" + qr);
-
-                    response = reader.readLine();
-                    System.out.println("SERVEUR : " + response);
-                } else if (r2.contains("tentative 1/2")) {
-
-                 System.out.print("reessayer le mot de passe : ");
-                motDePasse = scanner.nextLine().trim();
-                writer.println("MOT_DE_PASSE:" + motDePasse);
-                 response = reader.readLine();
-    System.out.println("SERVEUR : " + response);
-    if (response == null) return;
-                String r3 = response.toLowerCase(Locale.ROOT);
-                if (r3.contains("qr")) { 
-                    System.out.print("Scannez / entrez le code QR : ");
-                    String qr = scanner.nextLine().trim();
-                    writer.println("QR_CODE:" + qr);
-                    response = reader.readLine();
-                    System.out.println("SERVEUR : " + response);
-                } else {
-                   System.out.println("tentative 2 echouée , compte bloqué"); 
+                    out.println("QR_CODE:" + qr);
                 }
             }
-             else {
-            
-             }}
 
-            System.out.println("------------------------------------");
-            System.out.println("Session terminée.");
+            System.out.println("Fin de la communication avec le serveur.");
+
         } catch (IOException e) {
-            System.out.println(" Erreur de connexion au serveur : " + e.getMessage());
+            System.err.println("Erreur client: " + e.getMessage());
         }
     }
 }

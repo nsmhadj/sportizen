@@ -1,155 +1,261 @@
-# serveur_scenario.py
+import os
 import socket
 import threading
 from datetime import datetime, timedelta
 
-HOST = "localhost"
+import psycopg2
+import psycopg2.extras
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+HOST = "0.0.0.0"
 PORT = 11000
 
-# --- Données simulées (à adapter) ---
-players = {
-    "158": {"password": "1234", "status": "actif", "reservations": [401]},
-    "200": {"password": "0000", "status": "actif", "reservations": []},  # pas de résa
-}
 
-# match 401: 17:00–19:00 aujourd'hui (fenêtre -30min / +15min)
-now = datetime.now()
-match_start = now.replace(hour=22, minute=30, second=0, microsecond=0)
-match_end   = now.replace(hour=19, minute=0, second=0, microsecond=0)
-matches = {
-    401: {"start": match_start, "end": match_end}
-}
+def pg_conn():
+    """
+    Ouvre une connexion PostgreSQL en utilisant les variables d'environnement.
 
-tickets = {
-    "ABC123XYZ": {"joueur_id": "158", "match_id": 401, "used": False, "active": True},
-    "ZED900AAA": {"joueur_id": "158", "match_id": 401, "used": True,  "active": True},  # déjà utilisé
-}
+    Variables attendues :
+        PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, PGSSLMODE
+    """
+    return psycopg2.connect(
+        host=os.getenv("PGHOST"),
+        port=int(os.getenv("PGPORT", "5432")),
+        dbname=os.getenv("PGDATABASE"),
+        user=os.getenv("PGUSER"),
+        password=os.getenv("PGPASSWORD"),
+        sslmode=os.getenv("PGSSLMODE", "require"),
+    )
 
-GRACE_BEFORE_MIN = 30  # entrée possible 30 min avant
-GRACE_AFTER_MIN  = 15  # et 15 min après le début
 
-# --- Utilitaires ---
-def send_line(conn, text: str):
-    conn.sendall((text + "\n").encode("utf-8"))
+def get_user_by_id(id_joueur: int):
+    """Récupère un utilisateur par son id_utilisateur"""
+    with pg_conn() as c, c.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id_utilisateur,
+                   nom,
+                   prenom,
+                   mot_de_passe,
+                   date_naissance
+            FROM utilisateur
+            WHERE id_utilisateur = %s
+            """,
+            (id_joueur,),
+        )
+        return cur.fetchone()
 
-def read_line(conn) -> str:
-    data = b""
-    while not data.endswith(b"\n"):
-        chunk = conn.recv(1)
-        if not chunk:
-            break
-        data += chunk
-    return data.decode("utf-8").rstrip("\r\n")
 
-def in_window(t_scan: datetime, start: datetime, end: datetime) -> bool:
-    early = start - timedelta(minutes=GRACE_BEFORE_MIN)
-    late  = start + timedelta(minutes=GRACE_AFTER_MIN)
-    # Option: on refuse après la fin du match
-    hard_end = max(late, end)
-    return early <= t_scan <= hard_end
+def team_exists_for_user(id_joueur: int, nom_equipe: str) -> bool:
+    """
+    Vérifie s'il existe une réservation pour ce joueur
+    dans une équipe donnée, sur un match encore proposé.
+    """
+    with pg_conn() as c, c.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM reservation r
+            JOIN equipe e          ON r.id_equipe = e.id_equipe
+            JOIN match m           ON r.id_match = m.id_match
+            JOIN match_propose mp  ON m.id_match = mp.id_match_p
+            WHERE r.id_utilisateur = %s
+              AND LOWER(e.nom) = LOWER(%s)
+              AND (r.statut = 'confirmée' OR r.statut IS NULL)
+            LIMIT 1
+            """,
+            (id_joueur, nom_equipe),
+        )
+        return cur.fetchone() is not None
 
-# --- Dialogue par client ---
-def handle_client(conn, addr):
-    print(f"[+] Client connecté: {addr}")
+
+def valider_qr(id_joueur: int, qr_value: str):
+  
+    with pg_conn() as c, c.cursor() as cur:
+       
+        cur.execute(
+            """
+            SELECT r.qr_etat, c.debut_ts, r.id_reservation FROM reservation r JOIN match m   ON r.id_match = m.id_match JOIN creneau c ON m.id_creneau = c.id_creneau
+            WHERE r.id_utilisateur = %s AND r.qr_hash = %s AND (r.statut = 'confirmée' OR r.statut IS NULL)
+            LIMIT 1
+            """,
+            (id_joueur, qr_value),
+        )
+        row = cur.fetchone()
+        if not row:
+            return False, "QR invalide ou non associe"
+        qr_etat, debut_ts, id_res = row
+        if qr_etat is not None and qr_etat.lower() != "actif":
+            return False, "qr deja utilise"
+
+       
+        cur.execute(
+            """
+            UPDATE reservation SET qr_etat = 'inactif' WHERE id_reservation = %s
+            """,
+            (id_res,),
+        )
+    
+
+        return True, None
+
+
+def send_line(conn, msg: str):
+    """Envoie une ligne terminée par \\n, sans planter si le client a coupé."""
     try:
-        # Étape 1: attendre ID_JOUEUR
-        line = read_line(conn)
+        conn.sendall((msg + "\n").encode("utf-8"))
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+        pass
+
+def read_line(conn):
+    """
+    Lit une ligne terminée par \\n.
+    Retourne None si la socket est fermée.
+    """
+    data = bytearray()
+    try:
+        while True:
+            ch = conn.recv(1)
+            if not ch:
+                return None
+            if ch == b"\n":
+                break
+            data += ch
+        return data.decode("utf-8", errors="replace").strip()
+    except (ConnectionAbortedError, ConnectionResetError, OSError):
+        return None
+
+
+def handle_client(sock, addr):
+    try:
+        print(f"[INFO] Nouvelle connexion depuis {addr}")
+
+    
+        line = read_line(sock)
         if not line or not line.startswith("ID_JOUEUR:"):
-            send_line(conn, "Format invalide: attendu ID_JOUEUR:<id>")
+            send_line(sock, "ACCES REFUSE, MOTIF: format id invalide")
             return
 
-        id_joueur = line.split(":", 1)[1].strip()
-        joueur = players.get(id_joueur)
-
-        # Vérif joueur
-        if joueur is None or joueur.get("status") != "actif":
-            send_line(conn, "Joueur introuvable ou inactif")
+        try:
+            id_joueur = int(line.split(":", 1)[1].strip())
+        except ValueError:
+            send_line(sock, "ACCES REFUSE, MOTIF: id doit etre un entier")
             return
 
-        # Vérif réservation pour un match (exemple: 401)
-        target_match_id = 401
-        if target_match_id not in joueur.get("reservations", []):
-            send_line(conn, "Aucune réservation active pour ce match")
+        user = get_user_by_id(id_joueur)
+        if not user:
+            send_line(sock, "ACCES REFUSE, MOTIF: joueur inconnu")
             return
 
-        # Demander mot de passe
-        send_line(conn, "Joueur trouvé, veuillez entrer le mot de passe")
+        print(
+            f"[INFO] Connexion de {user['prenom']} {user['nom']} "
+            f"(ID {user['id_utilisateur']}) depuis {addr}"
+        )
 
-        # Étape 2: mot de passe (2 essais)
-        ok_pwd = False
-        for attempt in range(1, 4):
-            line = read_line(conn)
-            if not line or not line.startswith("MOT_DE_PASSE:"):
-                send_line(conn, f"Format invalide: attendu MOT_DE_PASSE:<valeur> (essai {attempt}/2)")
+      
+        db_date = user["date_naissance"]
+        if db_date is None:
+            send_line(sock, "ACCES REFUSE, MOTIF: date de naissance non definie en base")
+            return
+
+        db_date_str = db_date.strftime("%Y-%m-%d")
+        MAX_ATTEMPTS = 2
+
+        attempts_date = 0
+        while attempts_date < MAX_ATTEMPTS:
+            send_line(sock, "DATE_NAISSANCE:YYYY-MM-DD")
+            line = read_line(sock)
+            if line is None:
+                send_line(sock, "ACCES REFUSE, MOTIF: connexion interrompue")
+                return
+
+            if not line.startswith("DATE_NAISSANCE:"):
+                attempts_date += 1
                 continue
-            pwd = line.split(":", 1)[1].strip()
-            if pwd == joueur["password"]:
-                ok_pwd = True
+
+            saisie_date = line.split(":", 1)[1].strip()
+            if saisie_date == db_date_str:
                 break
             else:
-                if attempt < 3 :
-                    send_line(conn, f"Mot de passe erroné, tentative {attempt}/2")
-                else:
-                    send_line(conn, "Compte bloqué après 2 tentatives")
-        if not ok_pwd:
-            return
-        send_line(conn, "Mot de passe conforme, veuillez scanner le code QR")
+                attempts_date += 1
 
-        # Étape 3: QR_CODE
-        line = read_line(conn)  
-        if not line or not line.startswith("QR_CODE:"):
-            send_line(conn, "Format invalide: attendu QR_CODE:<code>")
-            return
-        qr_code = line.split(":", 1)[1].strip()
-
-        ticket = tickets.get(qr_code)
-        if ticket is None:
-            send_line(conn, "QR code invalide, accès refusé")
-            return
-        if not ticket.get("active", False):
-            send_line(conn, "QR inactif/annulé, accès refusé")
-            return
-        if ticket.get("used", False):
-            send_line(conn, "QR déjà utilisé, accès refusé")
-            return
-        if ticket["joueur_id"] != id_joueur:
-            send_line(conn, "QR non associé à ce joueur, accès refusé")
-            return
-        if ticket["match_id"] != target_match_id:
-            send_line(conn, "QR non valable pour ce match, accès refusé")
+        if attempts_date >= MAX_ATTEMPTS:
+            send_line(sock, "ACCES REFUSE, MOTIF: date de naissance incorrecte")
             return
 
-        # Vérif fenêtre horaire
-        tscan = datetime.now()
-        m = matches.get(ticket["match_id"])
-        if not m or not in_window(tscan, m["start"], m["end"]):
-            send_line(conn, "Hors fenêtre horaire, accès refusé")
+      
+        attempts_team = 0
+        while attempts_team < MAX_ATTEMPTS:
+            send_line(sock, "NOM_EQUIPE:?")
+            line = read_line(sock)
+            if line is None:
+                send_line(sock, "ACCES REFUSE, MOTIF: connexion interrompue")
+                return
+
+            if not line.startswith("NOM_EQUIPE:"):
+                attempts_team += 1
+                continue
+
+            nom_equipe = line.split(":", 1)[1].strip()
+            if team_exists_for_user(id_joueur, nom_equipe):
+                break
+            else:
+                attempts_team += 1
+
+        if attempts_team >= MAX_ATTEMPTS:
+            send_line(sock, "ACCES REFUSE, MOTIF: aucune reservation active pour cette equipe")
             return
 
-        # Commit: marquer utilisé
-        ticket["used"] = True
-        send_line(conn, "Accès autorisé, ouverture porte")
+   
+        send_line(sock, "QR_CODE:?")
+        line = read_line(sock)
+        if line is None or not line.startswith("QR_CODE:"):
+            send_line(sock, "ACCES REFUSE, MOTIF: qr manquant ou format invalide")
+            return
+
+        qr_value = line.split(":", 1)[1].strip()
+
+        ok, motif = valider_qr(id_joueur, qr_value)
+        if not ok:
+            send_line(sock, f"ACCES REFUSE, MOTIF: {motif}")
+            return
+
+       
+        send_line(sock, "ACCES AUTORISE")
 
     except Exception as e:
-        print(f"[!] Erreur côté serveur: {e}")
+        print(f"[ERREUR] {e}")
         try:
-            send_line(conn, "Erreur serveur, réessayez plus tard")
+            send_line(sock, "ACCES REFUSE, MOTIF: erreur interne")
         except Exception:
             pass
     finally:
-        conn.close()
-        print(f"[-] Client déconnecté: {addr}")
+        try:
+            sock.close()
+        except Exception:
+            pass
+        print(f"[INFO] Connexion fermee pour {addr}")
+
 
 def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((HOST, PORT))
         s.listen(5)
-        print(f"Serveur démarré sur {HOST}:{PORT} — prêt pour le client Java")
-
+        print(f"Serveur en ecoute sur {HOST}:{PORT}")
         while True:
             conn, addr = s.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+            threading.Thread(
+                target=handle_client,
+                args=(conn, addr),
+                daemon=True,
+            ).start()
+
 
 if __name__ == "__main__":
     main()
