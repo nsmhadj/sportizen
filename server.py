@@ -16,10 +16,10 @@ HOST = "0.0.0.0"
 PORT = 11000
 
 def pg_conn():
-    """Ouvre une connexion PostgreSQL en utilisant les variables d'environnement."""
+    """ connexion avec le serveur BD """
     return psycopg2.connect(
         host=os.getenv("PGHOST"),
-        port=int(os.getenv("PGPORT", "5432")),
+        port=int(os.getenv("PGPORT")),
         dbname=os.getenv("PGDATABASE"),
         user=os.getenv("PGUSER"),
         password=os.getenv("PGPASSWORD"),
@@ -62,7 +62,7 @@ def team_exists_for_user(id_joueur: int, nom_equipe: str) -> bool:
 
 def parse_qr_code(qr_code: str):
     """
-    Parse le code QR du format RES-<id_reservation>-<hash_prefix>
+    Parse le code QR du format RES-<id_reservation>-<hash_prefix> , pour utiliser la verification des codes hachés
     Renvoie (id_reservation:int, hash_prefix:str) ou (None, None) si format incorrect
     """
     import re
@@ -86,7 +86,7 @@ def valider_qr(id_joueur: int, qr_code: str):
         return False, "Code QR invalide (format attendu RES-...)", None
 
     with pg_conn() as c, c.cursor() as cur:
-        # Récupération de la réservation avec le hash, état QR et date de match
+       
         cur.execute("""
             SELECT r.qr_hash, r.qr_etat, c.debut_ts, r.id_utilisateur
             FROM reservation r

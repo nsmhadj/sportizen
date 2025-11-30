@@ -6,8 +6,8 @@ import java.net.Socket;
 import java.util.Scanner;
 
 public class client {
-
-    private static final String HOST = "127.0.0.1"; // adapte si besoin
+//connexion avec server applicatif sur localhost port 11000 
+    private static final String HOST = "127.0.0.1"; 
     private static final int PORT = 11000;
 
     public static void main(String[] args) {
